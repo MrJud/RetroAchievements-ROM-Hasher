@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">RA ROM Hasher</string>
+    <string name="notification_channel">Hasher Progress</string>
+    <string name="notification_title">Hashing ROMs…</string>
+    <string name="notification_done">Scan complete</string>
+    <string name="notification_cancel">Cancel</string>
+</resources>
