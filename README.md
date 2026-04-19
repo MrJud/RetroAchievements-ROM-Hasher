@@ -1,4 +1,4 @@
-# RetroAchievements Pegasus Frontend
+# RetroAchievements for Pegasus Frontend
 
 A companion app for [Pegasus Frontend](https://pegasus-frontend.org/) that scans ROM folders, hashes files using [rcheevos](https://github.com/RetroAchievements/rcheevos), looks up games on the RetroAchievements API, and writes a JSON cache file that compatible themes can read to display achievements, badges, and game metadata.
 
