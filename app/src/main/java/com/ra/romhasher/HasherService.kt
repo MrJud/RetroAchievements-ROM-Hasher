@@ -329,7 +329,11 @@ class HasherService : Service() {
                 put("totalFiles", totalFiles)
                 put("timestamp", System.currentTimeMillis())
             }
-            progressFile?.writeText(json.toString())
+            progressFile?.let { pf ->
+                val tmp = File(pf.absolutePath + ".tmp")
+                tmp.writeText(json.toString())
+                tmp.renameTo(pf)
+            }
         } catch (e: Exception) {
             Log.w(TAG, "Failed to write progress file", e)
         }
