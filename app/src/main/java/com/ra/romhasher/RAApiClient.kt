@@ -89,8 +89,7 @@ class RAApiClient(
                 title = obj.optString("Title", ""),
                 consoleName = obj.optString("ConsoleName", ""),
                 imageIcon = obj.optString("ImageIcon", ""),
-                numAchievements = obj.optInt("NumDistinctPlayersCasual", 0)
-                    .let { obj.optInt("NumAchievements", 0) }
+                numAchievements = obj.optInt("NumAchievements", 0)
             )
         } catch (e: Exception) {
             Log.e(TAG, "Metadata parse error for gameId=$gameId", e)
