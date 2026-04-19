@@ -202,15 +202,11 @@ class HasherService : Service() {
         var processed = 0
         var newEntries = 0
 
-        // Pre-count cached files so the UI shows only remaining work
+        // We count cached files on-the-fly inside the main loop.
+        // Initial estimate: assume all files need processing; correct as we skip.
         var cachedCount = 0
-        for (file in romFiles) {
-            val platform = guessPlatformFolder(file)
-            val key = CacheManager.makeKey(file.name, platform)
-            if (cache.hasEntry(key)) cachedCount++
-        }
-        val toProcess = total - cachedCount
-        Log.i(TAG, "Pre-scan: $total total, $cachedCount cached, $toProcess to process")
+        var toProcess = total
+        Log.i(TAG, "Starting scan: $total total files (cache check inline)")
 
         // Progress file for theme monitoring
         val pDir = File(config.cachePath).parentFile ?: File("/sdcard/ReStory")
@@ -227,6 +223,8 @@ class HasherService : Service() {
 
             // Skip if already cached with valid data
             if (cache.hasEntry(key)) {
+                cachedCount++
+                toProcess = total - cachedCount
                 continue
             }
 
