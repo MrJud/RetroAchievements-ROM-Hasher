@@ -1,6 +1,22 @@
-# RetroAchievements ROM Hasher
+# RetroAchievements Pegasus Frontend
 
-Standalone Android app that scans ROM folders, hashes files using [rcheevos](https://github.com/RetroAchievements/rcheevos), looks up games on the RetroAchievements API, and writes a JSON cache file. Designed for integration with Pegasus Frontend themes (or any launcher).
+A companion app for [Pegasus Frontend](https://pegasus-frontend.org/) that scans ROM folders, hashes files using [rcheevos](https://github.com/RetroAchievements/rcheevos), looks up games on the RetroAchievements API, and writes a JSON cache file that compatible themes can read to display achievements, badges, and game metadata.
+
+## Platform Support
+
+| Platform | Status |
+|----------|--------|
+| **Android** | ✅ Available |
+| **Windows** | 🚧 In progress |
+| **Linux** | 🚧 In progress |
+
+## Compatible Themes
+
+| Theme | Platform | Link |
+|-------|----------|------|
+| **ReStory** | Pegasus Frontend | _Coming soon_ |
+
+> Want to add support to your theme? See the [Integration](#integration-for-theme-developers) section below.
 
 ## Features
 
@@ -36,7 +52,7 @@ end
 | `ra_user` | String | RetroAchievements username (required) |
 | `ra_api_key` | String | RetroAchievements web API key (required) |
 | `rom_dirs` | String[] | Directories to scan (optional, reads `game_dirs.txt` if omitted) |
-| `cache_path` | String | Output path (default: `/sdcard/ReStory/ra_hashes_cache.json`) |
+| `cache_path` | String | Output path (default: `/sdcard/your_theme/ra_hashes_cache.json`) |
 
 ### QML example (Pegasus Frontend)
 
@@ -58,7 +74,7 @@ function launchHasher() {
 
 ### Read the cache
 
-The app writes a JSON file (default `/sdcard/ReStory/ra_hashes_cache.json`):
+The app writes a JSON file (default `/sdcard/your_theme/ra_hashes_cache.json`):
 
 ```json
 {

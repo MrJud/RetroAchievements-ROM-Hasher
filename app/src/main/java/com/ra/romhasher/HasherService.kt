@@ -27,8 +27,12 @@ class HasherService : Service() {
         private const val TAG = "HasherService"
         private const val CHANNEL_ID = "hasher_progress"
         private const val NOTIFICATION_ID = 1
-        private const val SAVE_INTERVAL = 50
+        private const val SAVE_INTERVAL = 30
         const val EXTRA_CONFIG = "config_json"
+
+        // I/O degradation thresholds
+        private const val IO_COOLDOWN_MS = 1500L          // pause when I/O is degraded
+        private const val IO_SEVERE_COOLDOWN_MS = 3000L   // longer pause for severe degradation
 
         @Volatile
         var isRunning = false
@@ -38,11 +42,95 @@ class HasherService : Service() {
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private var wakeLock: PowerManager.WakeLock? = null
     private var job: Job? = null
+    private var progressFile: File? = null
+    private lateinit var powerManager: PowerManager
+
+    // ── I/O degradation tracking ────────────────────────────────────────
+    // Track the best observed hash rate to detect SD card I/O degradation.
+    // Uses a dual approach: absolute threshold + relative degradation.
+    private var bestObservedKBperMs = 0.0   // best rate seen so far (self-calibrating)
+    private var hashCount = 0               // number of hashes measured
+
+    /**
+     * Compute I/O cooldown based on measured hash throughput.
+     *
+     * Two-tier detection:
+     * 1. ABSOLUTE: if hash rate < 10 KB/ms (~10 MB/s) for files > 1MB, the SD card is clearly struggling
+     * 2. RELATIVE: if rate drops to < 1/5 of the best observed rate, degradation is occurring
+     *
+     * The best rate self-calibrates upward — when the SD card is fresh it will
+     * hash at 400-600 KB/ms, setting a high bar. When it degrades, we detect it.
+     */
+    private fun ioDelayMs(hashTimeMs: Long, fileKB: Long): Long {
+        if (hashTimeMs <= 0 || fileKB < 64) return 0 // skip tiny files
+        val rate = fileKB.toDouble() / hashTimeMs     // KB/ms
+        hashCount++
+
+        // Self-calibrating: always track the best rate we've seen
+        if (rate > bestObservedKBperMs) {
+            val old = bestObservedKBperMs
+            bestObservedKBperMs = rate
+            if (hashCount > 1 && rate > old * 2) {
+                Log.i(TAG, "I/O best rate updated: ${"%.1f".format(rate)} KB/ms (was ${"%.1f".format(old)})")
+            }
+        }
+
+        // Absolute threshold: < 10 KB/ms for files > 1MB is clearly degraded
+        // (A healthy SD card does 100-600 KB/ms for ROM-sized files)
+        if (fileKB > 1024 && rate < 10.0) {
+            return if (rate < 2.0) IO_SEVERE_COOLDOWN_MS else IO_COOLDOWN_MS
+        }
+
+        // Relative threshold: if we've seen fast rates and now it's much slower
+        if (bestObservedKBperMs > 50.0 && rate < bestObservedKBperMs / 5.0) {
+            return if (rate < bestObservedKBperMs / 20.0) IO_SEVERE_COOLDOWN_MS else IO_COOLDOWN_MS
+        }
+
+        return 0L
+    }
+
+    /**
+     * Adaptive delay based on real-time thermal status from PowerManager.
+     * Returns the delay in ms to wait after each hash operation.
+     */
+    private fun thermalDelayMs(): Long {
+        val status = try {
+            powerManager.currentThermalStatus
+        } catch (_: Exception) {
+            PowerManager.THERMAL_STATUS_NONE
+        }
+        return when (status) {
+            PowerManager.THERMAL_STATUS_NONE     -> 0L      // Cool — full speed
+            PowerManager.THERMAL_STATUS_LIGHT    -> 150L    // Warm — light brake
+            PowerManager.THERMAL_STATUS_MODERATE -> 600L    // Hot  — steady pace
+            PowerManager.THERMAL_STATUS_SEVERE   -> 2000L   // Very hot — heavy brake
+            PowerManager.THERMAL_STATUS_CRITICAL -> 5000L   // Critical — long pause
+            else                                  -> 10000L  // Emergency/shutdown — cool down hard
+        }
+    }
+
+    /**
+     * Log thermal status periodically so we can see transitions in logcat.
+     */
+    private fun thermalStatusName(): String {
+        val status = try { powerManager.currentThermalStatus } catch (_: Exception) { -1 }
+        return when (status) {
+            PowerManager.THERMAL_STATUS_NONE     -> "NONE"
+            PowerManager.THERMAL_STATUS_LIGHT    -> "LIGHT"
+            PowerManager.THERMAL_STATUS_MODERATE -> "MODERATE"
+            PowerManager.THERMAL_STATUS_SEVERE   -> "SEVERE"
+            PowerManager.THERMAL_STATUS_CRITICAL -> "CRITICAL"
+            PowerManager.THERMAL_STATUS_EMERGENCY -> "EMERGENCY"
+            PowerManager.THERMAL_STATUS_SHUTDOWN -> "SHUTDOWN"
+            else -> "UNKNOWN($status)"
+        }
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
+        powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         createNotificationChannel()
     }
 
@@ -114,73 +202,137 @@ class HasherService : Service() {
         var processed = 0
         var newEntries = 0
 
-        // Process in parallel batches via coroutines (semaphore in RAApiClient limits to 8)
-        coroutineScope {
-            romFiles.map { file ->
-                async {
-                    if (!isActive) return@async
+        // Pre-count cached files so the UI shows only remaining work
+        var cachedCount = 0
+        for (file in romFiles) {
+            val platform = guessPlatformFolder(file)
+            val key = CacheManager.makeKey(file.name, platform)
+            if (cache.hasEntry(key)) cachedCount++
+        }
+        val toProcess = total - cachedCount
+        Log.i(TAG, "Pre-scan: $total total, $cachedCount cached, $toProcess to process")
 
-                    val platform = guessPlatformFolder(file)
-                    val key = CacheManager.makeKey(file.name, platform)
+        // Progress file for theme monitoring
+        val pDir = File(config.cachePath).parentFile ?: File("/sdcard/ReStory")
+        pDir.mkdirs()
+        progressFile = File(pDir, "hasher_progress.json")
+        writeProgress("running", 0, toProcess, "", 0, "", cachedCount, total)
 
-                    // Skip if already cached with valid data
-                    if (cache.hasEntry(key)) {
-                        synchronized(this@HasherService) {
-                            processed++
-                            if (processed % 20 == 0) {
-                                updateNotification(
-                                    "[$processed/$total] ${file.name}",
-                                    processed, total
-                                )
-                            }
-                        }
-                        return@async
+        // Process files sequentially (hashing is CPU-bound / IO-bound for large files)
+        for (file in romFiles) {
+            if (!scope.isActive) break
+
+            val platform = guessPlatformFolder(file)
+            val key = CacheManager.makeKey(file.name, platform)
+
+            // Skip if already cached with valid data
+            if (cache.hasEntry(key)) {
+                continue
+            }
+
+            // Hash the file (handle ZIP extraction)
+            val fileKB = file.length() / 1024
+            Log.d(TAG, "Hashing: ${file.name} (${fileKB}KB)")
+            val hashStart = System.nanoTime()
+            val hashResult = try {
+                withContext(Dispatchers.IO) { hashFile(file) }
+            } catch (e: Exception) {
+                Log.e(TAG, "Hash failed: ${file.name}", e)
+                null
+            }
+            val hashTimeMs = (System.nanoTime() - hashStart) / 1_000_000
+            if (hashResult == null) {
+                Log.w(TAG, "No hash for: ${file.name}")
+                processed++
+                continue
+            }
+            Log.d(TAG, "Hash OK: ${file.name} → ${hashResult.hash} (${hashTimeMs}ms)")
+
+            // ── Dual adaptive throttle: thermal (SoC) + I/O (SD card) ──
+            val thermDelay = thermalDelayMs()
+            val ioDelay = ioDelayMs(hashTimeMs, fileKB)
+            val effectiveDelay = maxOf(thermDelay, ioDelay)
+            if (effectiveDelay > 0) {
+                if (effectiveDelay >= 1000L) {
+                    val reason = when {
+                        ioDelay > thermDelay -> "I/O degraded"
+                        thermDelay > ioDelay -> "Thermal ${thermalStatusName()}"
+                        else -> "I/O+Thermal"
                     }
-
-                    // Hash the file (handle ZIP extraction)
-                    val hashResult = hashFile(file)
-                    if (hashResult == null) {
-                        synchronized(this@HasherService) { processed++ }
-                        return@async
-                    }
-
-                    // API lookup
-                    val metadata = apiClient.lookupHash(hashResult.hash)
-
-                    // Store result
-                    synchronized(this@HasherService) {
-                        if (metadata != null) {
-                            cache.put(key, hashResult.hash, metadata)
-                            newEntries++
-                        } else {
-                            // Store as gameId=0 so we don't re-hash next time
-                            cache.put(key, hashResult.hash, GameMetadata(gameId = 0))
-                        }
-                        processed++
-
-                        // Update notification
-                        if (processed % 5 == 0 || processed == total) {
-                            val pct = (processed * 100) / total
-                            updateNotification(
-                                "[$processed/$total] $pct% — ${file.name}",
-                                processed, total
-                            )
-                        }
-
-                        // Intermediate save
-                        if (newEntries > 0 && newEntries % SAVE_INTERVAL == 0) {
-                            cache.save()
-                        }
-                    }
+                    Log.i(TAG, "$reason — pause ${effectiveDelay}ms at $processed/$total (hash=${hashTimeMs}ms)")
                 }
-            }.awaitAll()
+                delay(effectiveDelay)
+            }
+            // API lookup
+            val metadata = try {
+                apiClient.lookupHash(hashResult.hash)
+            } catch (e: Exception) {
+                Log.e(TAG, "API failed: ${file.name}", e)
+                null
+            }
+
+            // Store result
+            if (metadata != null) {
+                cache.put(key, hashResult.hash, metadata)
+                newEntries++
+                Log.i(TAG, "[$processed/$total] FOUND: ${file.name} → gameId=${metadata.gameId}")
+            } else {
+                // Store as gameId=0 so we don't re-hash next time
+                cache.put(key, hashResult.hash, GameMetadata(gameId = 0))
+                Log.d(TAG, "[$processed/$total] No match: ${file.name}")
+            }
+            processed++
+
+            // Update notification + progress file every 3 files
+            if (processed % 3 == 0 || processed == toProcess) {
+                val pct = if (toProcess > 0) (processed * 100) / toProcess else 100
+                updateNotification("[$processed/$toProcess] $pct% \u2014 ${file.name}", processed, toProcess)
+                writeProgress("running", processed, toProcess, file.name, newEntries, platform, cachedCount, total)
+            }
+
+            // Intermediate save
+            if (newEntries > 0 && newEntries % SAVE_INTERVAL == 0) {
+                Log.i(TAG, "Intermediate save: $newEntries new entries")
+                cache.save()
+            }
+
+            // Log thermal + I/O status every 50 files for monitoring
+            if (processed % 50 == 0) {
+                val rate = if (hashTimeMs > 0) fileKB.toDouble() / hashTimeMs else 0.0
+                Log.i(TAG, "Status at $processed/$toProcess: thermal=${thermalStatusName()} " +
+                        "bestIO=${"%.0f".format(bestObservedKBperMs)}KB/ms " +
+                        "currentIO=${"%.1f".format(rate)}KB/ms " +
+                        "lastHash=${hashTimeMs}ms/${fileKB}KB")
+            }
         }
 
         // 3. Final save
         cache.save()
-        Log.i(TAG, "Scan complete: $processed processed, $newEntries new entries, ${cache.size()} total")
-        updateNotification("Done — $newEntries new games found (${cache.size()} total)", total, total)
+        Log.i(TAG, "Scan complete: $processed processed, $newEntries new entries, $cachedCount cached, ${cache.size()} total")
+        updateNotification("Done — $newEntries new games found (${cache.size()} total)", toProcess, toProcess)
+        writeProgress("done", processed, toProcess, "", newEntries, "", cachedCount, total)
         delay(3000) // Keep notification visible briefly
+    }
+
+    private fun writeProgress(status: String, processed: Int, total: Int, current: String, newEntries: Int, platform: String, cached: Int, totalFiles: Int) {
+        try {
+            val pct = if (total > 0) (processed * 100) / total else 100
+            val json = org.json.JSONObject().apply {
+                put("status", status)
+                put("processed", processed)
+                put("total", total)
+                put("percent", pct)
+                put("current", current)
+                put("newEntries", newEntries)
+                put("platform", platform)
+                put("cached", cached)
+                put("totalFiles", totalFiles)
+                put("timestamp", System.currentTimeMillis())
+            }
+            progressFile?.writeText(json.toString())
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to write progress file", e)
+        }
     }
 
     // ── File hashing (with ZIP support) ─────────────────────────────────
