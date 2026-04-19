@@ -42,7 +42,10 @@ object SettingsReader {
         // 1. Try Intent extras
         val user = intent?.getStringExtra("ra_user")?.takeIf { it.isNotBlank() }
         val key = intent?.getStringExtra("ra_api_key")?.takeIf { it.isNotBlank() }
+        // Support both String[] (programmatic) and pipe-delimited String (Intent URI)
         val dirs = intent?.getStringArrayExtra("rom_dirs")?.toList()
+            ?: intent?.getStringExtra("rom_dirs")?.takeIf { it.isNotBlank() }
+                ?.split("|")?.map { it.trim() }?.filter { it.isNotEmpty() }
         val path = intent?.getStringExtra("cache_path")?.takeIf { it.isNotBlank() }
 
         // 2. If missing credentials, try config file
