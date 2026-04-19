@@ -2,6 +2,7 @@ package com.ra.romhasher
 
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
@@ -60,7 +61,7 @@ class RAApiClient(
     /**
      * Step 1: hash → GameID
      */
-    private fun fetchGameId(hash: String): Int? {
+    private suspend fun fetchGameId(hash: String): Int? {
         val url = "$BASE/dorequest.php?r=gameid&m=$hash"
         val body = httpGetWithRetry(url) ?: return null
         return try {
@@ -76,7 +77,7 @@ class RAApiClient(
     /**
      * Step 2: GameID → metadata (title, console, icon, achievement count)
      */
-    private fun fetchMetadata(gameId: Int): GameMetadata? {
+    private suspend fun fetchMetadata(gameId: Int): GameMetadata? {
         val url = "$BASE/API/API_GetGame.php?z=$raUser&y=$raApiKey&i=$gameId"
         val body = httpGetWithRetry(url) ?: return null
         return try {
@@ -120,7 +121,7 @@ class RAApiClient(
     /**
      * HTTP GET with retry on 429/5xx, exponential backoff.
      */
-    private fun httpGetWithRetry(url: String): String? {
+    private suspend fun httpGetWithRetry(url: String): String? {
         var lastException: Exception? = null
         for (attempt in 0 until MAX_RETRIES) {
             try {
@@ -132,9 +133,9 @@ class RAApiClient(
                     when {
                         response.isSuccessful -> return response.body?.string()
                         response.code == 429 || response.code >= 500 -> {
-                            val delay = (1000L shl attempt) // 1s, 2s, 4s
-                            Log.w(TAG, "HTTP ${response.code} for $url — retry in ${delay}ms")
-                            Thread.sleep(delay)
+                            val backoffMs = (1000L shl attempt) // 1s, 2s, 4s
+                            Log.w(TAG, "HTTP ${response.code} for $url — retry in ${backoffMs}ms")
+                            delay(backoffMs)
                         }
                         else -> {
                             Log.w(TAG, "HTTP ${response.code} for $url — not retrying")
@@ -144,9 +145,9 @@ class RAApiClient(
                 }
             } catch (e: Exception) {
                 lastException = e
-                val delay = (1000L shl attempt)
-                Log.w(TAG, "Request error for $url — retry in ${delay}ms", e)
-                Thread.sleep(delay)
+                val backoffMs = (1000L shl attempt)
+                Log.w(TAG, "Request error for $url — retry in ${backoffMs}ms", e)
+                delay(backoffMs)
             }
         }
         Log.e(TAG, "All retries exhausted for $url", lastException)
