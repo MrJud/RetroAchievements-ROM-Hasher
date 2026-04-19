@@ -14,7 +14,7 @@ A companion app for [Pegasus Frontend](https://pegasus-frontend.org/) that scans
 
 | Theme | Platform | Link |
 |-------|----------|------|
-| **ReStory** | Pegasus Frontend | _Coming soon_ |
+| **ReStory** | Pegasus Frontend | [GitHub](https://github.com/MrJud/ReStory) |
 
 > Want to add support to your theme? See the [Integration](#integration-for-theme-developers) section below.
 
