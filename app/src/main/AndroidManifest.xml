@@ -46,12 +46,12 @@
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
 
-            <!-- URI-based launch (intent://scan#Intent;package=...) -->
+            <!-- URI-based launch (rahasher://scan?ra_user=...&ra_api_key=...) -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="intent" />
+                <data android:scheme="rahasher" android:host="scan" />
             </intent-filter>
         </activity>
 

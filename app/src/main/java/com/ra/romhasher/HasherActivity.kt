@@ -24,6 +24,16 @@ class HasherActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // If launched via custom URI, extract query params into extras
+        intent?.data?.let { uri ->
+            if (uri.scheme == "rahasher") {
+                uri.getQueryParameter("ra_user")?.let { intent.putExtra("ra_user", it) }
+                uri.getQueryParameter("ra_api_key")?.let { intent.putExtra("ra_api_key", it) }
+                uri.getQueryParameter("rom_dirs")?.let { intent.putExtra("rom_dirs", it) }
+                uri.getQueryParameter("cache_path")?.let { intent.putExtra("cache_path", it) }
+            }
+        }
+
         // Handle cancel action forwarded to service
         if (intent?.action == "CANCEL") {
             stopService(Intent(this, HasherService::class.java))
