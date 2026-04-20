@@ -12,8 +12,10 @@ import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
 import java.io.File
-import java.util.zip.ZipInputStream
+import java.util.zip.ZipFile
+import org.apache.commons.compress.archivers.sevenz.SevenZFile
 
 /**
  * Foreground service that performs the full ROM scan → hash → API lookup → cache write pipeline.
@@ -31,8 +33,8 @@ class HasherService : Service() {
         const val EXTRA_CONFIG = "config_json"
 
         // I/O degradation thresholds
-        private const val IO_COOLDOWN_MS = 1500L          // pause when I/O is degraded
-        private const val IO_SEVERE_COOLDOWN_MS = 3000L   // longer pause for severe degradation
+        private const val IO_COOLDOWN_MS = 500L            // pause when I/O is degraded
+        private const val IO_SEVERE_COOLDOWN_MS = 1500L    // longer pause for severe degradation
 
         @Volatile
         var isRunning = false
@@ -55,35 +57,27 @@ class HasherService : Service() {
      * Compute I/O cooldown based on measured hash throughput.
      *
      * Two-tier detection:
-     * 1. ABSOLUTE: if hash rate < 10 KB/ms (~10 MB/s) for files > 1MB, the SD card is clearly struggling
-     * 2. RELATIVE: if rate drops to < 1/5 of the best observed rate, degradation is occurring
+     * Compute I/O cooldown based on RELATIVE degradation vs best observed rate.
      *
-     * The best rate self-calibrates upward — when the SD card is fresh it will
-     * hash at 400-600 KB/ms, setting a high bar. When it degrades, we detect it.
+     * The previous absolute threshold (rate < 5 KB/ms) was too aggressive: 3-5 KB/ms is the
+     * nominal speed of a budget SD card on non-cached ROMs, NOT degradation.
+     *
+     * Strategy: self-calibration of best rate after warmup (20 hashes). If rate drops
+     * below 1/10 of best observed, it's real degradation (thermal or SD card wear).
      */
     private fun ioDelayMs(hashTimeMs: Long, fileKB: Long): Long {
-        if (hashTimeMs <= 0 || fileKB < 64) return 0 // skip tiny files
-        val rate = fileKB.toDouble() / hashTimeMs     // KB/ms
+        if (hashTimeMs <= 0 || fileKB < 256) return 0
+        val rate = fileKB.toDouble() / hashTimeMs
         hashCount++
 
-        // Self-calibrating: always track the best rate we've seen
-        if (rate > bestObservedKBperMs) {
-            val old = bestObservedKBperMs
+        // Exclude OS page-cache hits (< 200ms) and cap at 100 KB/ms (realistic SD max)
+        if (hashCount > 10 && hashTimeMs > 200 && rate > bestObservedKBperMs && rate < 100.0) {
             bestObservedKBperMs = rate
-            if (hashCount > 1 && rate > old * 2) {
-                Log.i(TAG, "I/O best rate updated: ${"%.1f".format(rate)} KB/ms (was ${"%.1f".format(old)})")
-            }
         }
 
-        // Absolute threshold: < 10 KB/ms for files > 1MB is clearly degraded
-        // (A healthy SD card does 100-600 KB/ms for ROM-sized files)
-        if (fileKB > 1024 && rate < 10.0) {
-            return if (rate < 2.0) IO_SEVERE_COOLDOWN_MS else IO_COOLDOWN_MS
-        }
-
-        // Relative threshold: if we've seen fast rates and now it's much slower
-        if (bestObservedKBperMs > 50.0 && rate < bestObservedKBperMs / 5.0) {
-            return if (rate < bestObservedKBperMs / 20.0) IO_SEVERE_COOLDOWN_MS else IO_COOLDOWN_MS
+        // Only relative threshold: degradation = collapse vs best observed rate
+        if (hashCount > 20 && bestObservedKBperMs > 50.0 && rate < bestObservedKBperMs / 10.0) {
+            return if (rate < bestObservedKBperMs / 30.0) IO_SEVERE_COOLDOWN_MS else IO_COOLDOWN_MS
         }
 
         return 0L
@@ -134,7 +128,12 @@ class HasherService : Service() {
         createNotificationChannel()
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {        // Handle cancel action from notification
+        if (intent?.action == "CANCEL") {
+            Log.i(TAG, "Cancel requested from notification")
+            job?.cancel()
+            return START_NOT_STICKY
+        }
         if (isRunning) {
             Log.w(TAG, "Scan already in progress — ignoring")
             stopSelf()
@@ -180,7 +179,10 @@ class HasherService : Service() {
 
     // ── Main scan pipeline ──────────────────────────────────────────────
 
-    private suspend fun runScan(config: HasherConfig) {
+    private data class HashJob(val file: File, val key: String, val hash: HashResult, val platform: String, val fileKB: Long)
+    private data class ResultJob(val job: HashJob, val metadata: GameMetadata?)
+
+    private suspend fun runScan(config: HasherConfig) = coroutineScope {
         val cache = CacheManager(config.cachePath)
         val existingCount = cache.load()
         Log.i(TAG, "Loaded cache: $existingCount existing entries")
@@ -194,19 +196,12 @@ class HasherService : Service() {
         if (total == 0) {
             updateNotification("No ROMs found", 0, 0)
             delay(2000)
-            return
+            return@coroutineScope
         }
 
-        // 2. Hash + API lookup for each file
         val apiClient = RAApiClient(config.raUser, config.raApiKey)
-        var processed = 0
-        var newEntries = 0
-
-        // We count cached files on-the-fly inside the main loop.
-        // Initial estimate: assume all files need processing; correct as we skip.
         var cachedCount = 0
         var toProcess = total
-        Log.i(TAG, "Starting scan: $total total files (cache check inline)")
 
         // Progress file for theme monitoring
         val pDir = File(config.cachePath).parentFile ?: File("/sdcard/ReStory")
@@ -214,78 +209,123 @@ class HasherService : Service() {
         progressFile = File(pDir, "hasher_progress.json")
         writeProgress("running", 0, toProcess, "", 0, "", cachedCount, total)
 
-        // Process files sequentially (hashing is CPU-bound / IO-bound for large files)
-        for (file in romFiles) {
-            if (!scope.isActive) break
+        // ── Pipeline: producer (hash) → channel → worker pool (API) → channel → collector (cache) ──
 
-            val platform = guessPlatformFolder(file)
-            val key = CacheManager.makeKey(file.name, platform)
+        val hashChannel = Channel<HashJob>(capacity = 16)
+        val resultChannel = Channel<ResultJob>(capacity = 64)
 
-            // Skip if already cached with valid data
-            if (cache.hasEntry(key)) {
-                cachedCount++
-                toProcess = total - cachedCount
-                continue
-            }
+        // In-memory hash dedup: avoids duplicate API calls for ROMs with identical hashes
+        val hashLookupCache = mutableMapOf<String, GameMetadata?>()
 
-            // Hash the file (handle ZIP extraction)
-            val fileKB = file.length() / 1024
-            Log.d(TAG, "Hashing: ${file.name} (${fileKB}KB)")
-            val hashStart = System.nanoTime()
-            val hashResult = try {
-                withContext(Dispatchers.IO) { hashFile(file) }
-            } catch (e: Exception) {
-                Log.e(TAG, "Hash failed: ${file.name}", e)
-                null
-            }
-            val hashTimeMs = (System.nanoTime() - hashStart) / 1_000_000
-            if (hashResult == null) {
-                Log.w(TAG, "No hash for: ${file.name}")
-                processed++
-                continue
-            }
-            Log.d(TAG, "Hash OK: ${file.name} → ${hashResult.hash} (${hashTimeMs}ms)")
+        // Producer: sequential hashing with thermal/IO throttle
+        val producer = launch(Dispatchers.Default) {
+            for (file in romFiles) {
+                if (!isActive) break
 
-            // ── Dual adaptive throttle: thermal (SoC) + I/O (SD card) ──
-            val thermDelay = thermalDelayMs()
-            val ioDelay = ioDelayMs(hashTimeMs, fileKB)
-            val effectiveDelay = maxOf(thermDelay, ioDelay)
-            if (effectiveDelay > 0) {
-                if (effectiveDelay >= 1000L) {
-                    val reason = when {
-                        ioDelay > thermDelay -> "I/O degraded"
-                        thermDelay > ioDelay -> "Thermal ${thermalStatusName()}"
-                        else -> "I/O+Thermal"
-                    }
-                    Log.i(TAG, "$reason — pause ${effectiveDelay}ms at $processed/$total (hash=${hashTimeMs}ms)")
+                val platform = guessPlatformFolder(file)
+                val key = CacheManager.makeKey(file.name, platform)
+
+                // Skip if already cached with valid data
+                if (cache.hasEntry(key)) {
+                    cachedCount++
+                    toProcess = total - cachedCount
+                    continue
                 }
-                delay(effectiveDelay)
-            }
-            // API lookup
-            val metadata = try {
-                apiClient.lookupHash(hashResult.hash)
-            } catch (e: Exception) {
-                Log.e(TAG, "API failed: ${file.name}", e)
-                null
-            }
 
-            // Store result
-            if (metadata != null) {
-                cache.put(key, hashResult.hash, metadata)
-                newEntries++
-                Log.i(TAG, "[$processed/$total] FOUND: ${file.name} → gameId=${metadata.gameId}")
-            } else {
-                // Store as gameId=0 so we don't re-hash next time
-                cache.put(key, hashResult.hash, GameMetadata(gameId = 0))
-                Log.d(TAG, "[$processed/$total] No match: ${file.name}")
+                // Hash the file
+                val fileKB = file.length() / 1024
+                Log.d(TAG, "Hashing: ${file.name} (${fileKB}KB)")
+                val hashStart = System.nanoTime()
+                val hashResult = try {
+                    withContext(Dispatchers.IO) { hashFile(file) }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Hash failed: ${file.name}", e)
+                    null
+                }
+                val hashTimeMs = (System.nanoTime() - hashStart) / 1_000_000
+                if (hashResult == null) {
+                    Log.w(TAG, "No hash for: ${file.name}")
+                    resultChannel.send(ResultJob(HashJob(file, key, HashResult("", 0), platform, fileKB), null))
+                    continue
+                }
+                Log.d(TAG, "Hash OK: ${file.name} → ${hashResult.hash} (${hashTimeMs}ms)")
+
+                // ── Dual adaptive throttle: thermal (SoC) + I/O (SD card) ──
+                val thermDelay = thermalDelayMs()
+                val ioDelay = ioDelayMs(hashTimeMs, fileKB)
+                val effectiveDelay = maxOf(thermDelay, ioDelay)
+                if (effectiveDelay > 0) {
+                    if (effectiveDelay >= 400L) {
+                        val reason = when {
+                            ioDelay > thermDelay -> "I/O degraded"
+                            thermDelay > ioDelay -> "Thermal ${thermalStatusName()}"
+                            else -> "I/O+Thermal"
+                        }
+                        Log.i(TAG, "$reason — pause ${effectiveDelay}ms (hash=${hashTimeMs}ms)")
+                    }
+                    delay(effectiveDelay)
+                }
+
+                hashChannel.send(HashJob(file, key, hashResult, platform, fileKB))
+            }
+            hashChannel.close()
+        }
+
+        // Worker pool: parallel API lookups (8 workers, matching RAApiClient semaphore)
+        val workers = List(8) {
+            launch(Dispatchers.IO) {
+                for (job in hashChannel) {
+                    // Dedup: skip API call if identical hash already looked up
+                    val metadata = synchronized(hashLookupCache) {
+                        if (job.hash.hash in hashLookupCache) hashLookupCache[job.hash.hash]
+                        else null // sentinel: need to look up
+                    }
+                    val finalMeta = if (metadata != null || synchronized(hashLookupCache) { job.hash.hash in hashLookupCache }) {
+                        if (metadata != null) Log.d(TAG, "Hash dedup hit: ${job.file.name} → ${job.hash.hash}")
+                        metadata
+                    } else {
+                        val result = try {
+                            apiClient.lookupHash(job.hash.hash)
+                        } catch (e: Exception) {
+                            Log.e(TAG, "API failed: ${job.file.name}", e)
+                            null
+                        }
+                        synchronized(hashLookupCache) { hashLookupCache[job.hash.hash] = result }
+                        result
+                    }
+                    resultChannel.send(ResultJob(job, finalMeta))
+                }
+            }
+        }
+
+        // Close resultChannel when all workers are done
+        launch {
+            producer.join()
+            workers.forEach { it.join() }
+            resultChannel.close()
+        }
+
+        // Collector: serial cache writes + progress updates (CacheManager is not thread-safe)
+        var processed = 0
+        var newEntries = 0
+        for (r in resultChannel) {
+            if (r.job.hash.hash.isNotEmpty()) {
+                if (r.metadata != null) {
+                    cache.put(r.job.key, r.job.hash.hash, r.metadata)
+                    newEntries++
+                    Log.i(TAG, "[$processed/$toProcess] FOUND: ${r.job.file.name} → gameId=${r.metadata.gameId}")
+                } else {
+                    cache.put(r.job.key, r.job.hash.hash, GameMetadata(gameId = 0))
+                    Log.d(TAG, "[$processed/$toProcess] No match: ${r.job.file.name}")
+                }
             }
             processed++
 
             // Update notification + progress file every 3 files
             if (processed % 3 == 0 || processed == toProcess) {
                 val pct = if (toProcess > 0) (processed * 100) / toProcess else 100
-                updateNotification("[$processed/$toProcess] $pct% \u2014 ${file.name}", processed, toProcess)
-                writeProgress("running", processed, toProcess, file.name, newEntries, platform, cachedCount, total)
+                updateNotification("[$processed/$toProcess] $pct% — ${r.job.file.name}", processed, toProcess)
+                writeProgress("running", processed, toProcess, r.job.file.name, newEntries, r.job.platform, cachedCount, total)
             }
 
             // Intermediate save
@@ -296,11 +336,9 @@ class HasherService : Service() {
 
             // Log thermal + I/O status every 50 files for monitoring
             if (processed % 50 == 0) {
-                val rate = if (hashTimeMs > 0) fileKB.toDouble() / hashTimeMs else 0.0
                 Log.i(TAG, "Status at $processed/$toProcess: thermal=${thermalStatusName()} " +
                         "bestIO=${"%.0f".format(bestObservedKBperMs)}KB/ms " +
-                        "currentIO=${"%.1f".format(rate)}KB/ms " +
-                        "lastHash=${hashTimeMs}ms/${fileKB}KB")
+                        "newEntries=$newEntries cached=$cachedCount")
             }
         }
 
@@ -341,52 +379,65 @@ class HasherService : Service() {
 
     private fun hashFile(file: File): HashResult? {
         val ext = file.extension.lowercase()
-        return if (ext == "zip") {
-            hashZipFile(file)
-        } else {
-            NativeHasher.hash(file.absolutePath)
+        return when (ext) {
+            "zip" -> hashZipFile(file)
+            "7z"  -> hash7zFile(file)
+            else  -> NativeHasher.hash(file.absolutePath)
         }
     }
 
     /**
-     * For ZIP files: extract the largest entry to a temp file, hash it, then clean up.
+     * For ZIP files: use ZipFile (random access) for single-pass extraction of the largest entry.
      */
     private fun hashZipFile(zipFile: File): HashResult? {
-        try {
-            ZipInputStream(zipFile.inputStream()).use { zis ->
-                var largestEntry: Pair<String, Long>? = null
-                var entry = zis.nextEntry
-                while (entry != null) {
-                    if (!entry.isDirectory && entry.size > (largestEntry?.second ?: 0)) {
-                        largestEntry = entry.name to entry.size
-                    }
-                    zis.closeEntry()
-                    entry = zis.nextEntry
-                }
+        return try {
+            ZipFile(zipFile).use { zf ->
+                val largest = zf.entries().asSequence()
+                    .filter { !it.isDirectory }
+                    .maxByOrNull { it.size } ?: return null
 
-                if (largestEntry == null) return null
-
-                // Re-open and extract the largest entry
-                ZipInputStream(zipFile.inputStream()).use { zis2 ->
-                    var e = zis2.nextEntry
-                    while (e != null) {
-                        if (e.name == largestEntry.first) {
-                            val ext = e.name.substringAfterLast(".", "bin")
-                            val tmp = File.createTempFile("rahasher_", ".$ext", cacheDir)
-                            try {
-                                tmp.outputStream().use { out -> zis2.copyTo(out) }
-                                return NativeHasher.hash(tmp.absolutePath)
-                            } finally {
-                                tmp.delete()
-                            }
-                        }
-                        zis2.closeEntry()
-                        e = zis2.nextEntry
+                val ext = largest.name.substringAfterLast(".", "bin")
+                val tmp = File.createTempFile("rahasher_", ".$ext", cacheDir)
+                try {
+                    zf.getInputStream(largest).use { input ->
+                        tmp.outputStream().use { out -> input.copyTo(out) }
                     }
+                    NativeHasher.hash(tmp.absolutePath)
+                } finally {
+                    tmp.delete()
                 }
             }
         } catch (e: Exception) {
             Log.e(TAG, "ZIP extraction failed for ${zipFile.name}", e)
+            null
+        }
+    }
+
+    /**
+     * For 7z files: extract the largest entry to a temp file, hash it, then clean up.
+     */
+    private fun hash7zFile(sevenZFile: File): HashResult? {
+        try {
+            SevenZFile(sevenZFile).use { archive ->
+                // Find the largest entry
+                val largest = archive.entries
+                    .filter { !it.isDirectory && it.size > 0 }
+                    .maxByOrNull { it.size }
+                    ?: return null
+
+                val ext = largest.name.substringAfterLast(".", "bin")
+                val tmp = File.createTempFile("rahasher_", ".$ext", cacheDir)
+                try {
+                    archive.getInputStream(largest).use { input ->
+                        tmp.outputStream().use { out -> input.copyTo(out) }
+                    }
+                    return NativeHasher.hash(tmp.absolutePath)
+                } finally {
+                    tmp.delete()
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "7z extraction failed for ${sevenZFile.name}", e)
         }
         return null
     }
