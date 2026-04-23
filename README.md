@@ -105,8 +105,8 @@ Create `/sdcard/ReStory/hasher_config.json`:
 {
   "ra_user": "YourUsername",
   "ra_api_key": "YourApiKey",
-  "rom_dirs": ["/storage/3030-3363/Emulation/Roms"],
-  "cache_path": "/sdcard/ReStory/ra_hashes_cache.json"
+  "rom_dirs": ["/storage/your_roms_dir"],
+  "cache_path": "/sdcard/your_theme/ra_hashes_cache.json"
 }
 ```
 
